@@ -1,6 +1,7 @@
 """Tests for :mod:`summarizer.llm` — schema coercion, JSON repair and chunking."""
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -377,7 +378,9 @@ def test_quota_status_reads_the_free_model_quota(monkeypatch, make_settings) -> 
     assert llm.quota_status(settings) == {}
 
 
-def test_daily_quota_429_raises_llm_quota_exceeded(monkeypatch, make_settings) -> None:
+def test_daily_quota_429_raises_llm_quota_exceeded(
+    monkeypatch, make_settings, make_email
+) -> None:
     reset_ms = 1_735_689_600_000  # 2025-01-01T00:00:00Z
     quota_body = {
         "error": {"metadata": {"limit_source": "openrouter_free_tier_daily"}}
@@ -399,10 +402,17 @@ def test_daily_quota_429_raises_llm_quota_exceeded(monkeypatch, make_settings) -
 
     monkeypatch.setattr(requests, "post", fake_post)
     settings = make_settings(llm_attempts=3, llm_backoff_base=0.0)
+    target = llm.LLMTarget(
+        provider="openrouter",
+        base_url=settings.openrouter_api_base,
+        api_key="sk-test",
+        model="primary/model",
+        json_ladder=(True, False),
+    )
 
     with pytest.raises(llm.LLMQuotaExceeded) as info:
-        llm._openrouter_request(
-            settings, "primary/model", [{"role": "user", "content": "hi"}]
+        llm._call_target(
+            target, [{"role": "user", "content": "hi"}], settings, [make_email(1)]
         )
 
     assert len(posts) == 1
@@ -456,3 +466,174 @@ def test_summarize_stops_after_one_model_on_quota_and_falls_back(
     ]
     assert len(markers) == 30
     assert all("лимит бесплатных моделей" in marker for marker in markers)
+
+
+# ── GonkaRouter fallback ─────────────────────────────────────────────────────
+
+DIGEST_PAYLOAD = {
+    "mailboxes": [
+        {
+            "name": "Gmail",
+            "important": [{"sender": "bank@x.ru", "subject": "Списание", "summary": "Списали 5 000 ₽"}],
+            "work": [],
+            "other": [],
+            "newsletter_count": 0,
+            "spam_count": 0,
+        }
+    ],
+    "action_items": ["Проверить списание"],
+}
+
+
+class _QuotaResponse:
+    status_code = 429
+    headers = {"X-RateLimit-Reset": "1735689600000"}
+    text = '{"error": {"metadata": {"limit_source": "openrouter_free_tier_daily"}}}'
+
+    def json(self) -> dict:
+        return {"error": {"metadata": {"limit_source": "openrouter_free_tier_daily"}}}
+
+
+class _JsonResponse:
+    status_code = 200
+    headers: dict = {}
+    text = ""
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def json(self) -> dict:
+        return {
+            "choices": [
+                {"message": {"content": self._content}, "finish_reason": "stop"}
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        }
+
+
+def test_quota_on_openrouter_falls_through_to_gonkarouter(
+    monkeypatch, make_settings, make_email
+) -> None:
+    """The whole point of the fallback: an OpenRouter quota must not end the run."""
+    calls: list[dict] = []
+
+    def fake_post(url: str, **kwargs):
+        calls.append({"url": url, "headers": kwargs["headers"], "json": kwargs["json"]})
+        if "openrouter" in url:
+            return _QuotaResponse()
+        return _JsonResponse(json.dumps(DIGEST_PAYLOAD, ensure_ascii=False))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    settings = make_settings(
+        openrouter_model="primary/model",
+        gonkarouter_enabled=True,
+        gonkarouter_api_key="sk-gonka",
+        gonkarouter_model="MiniMaxAI/MiniMax-M2.7",
+        llm_attempts=1,
+    )
+
+    result = summarize([make_email(1)], settings)
+
+    assert result.provider == "gonkarouter"
+    assert result.model == "MiniMaxAI/MiniMax-M2.7"
+    assert result.quota_exhausted is False
+    assert result.total_emails == 1
+    assert any("gonkarouter" in call["url"] for call in calls)
+    # Only the primary OpenRouter model was tried before falling through.
+    openrouter_models = [c["json"]["model"] for c in calls if "openrouter" in c["url"]]
+    assert openrouter_models == ["primary/model"]
+
+
+def test_gonka_requests_carry_a_real_user_agent(monkeypatch, make_settings, make_email) -> None:
+    """Cloudflare in front of GonkaRouter returns 403 (error 1010) for python UAs."""
+    seen: list[str] = []
+
+    def fake_post(url: str, **kwargs):
+        seen.append(kwargs["headers"]["User-Agent"])
+        return _JsonResponse(json.dumps(DIGEST_PAYLOAD, ensure_ascii=False))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    settings = make_settings(
+        openrouter_api_key="",
+        llm_provider="gonkarouter",
+        gonkarouter_api_key="sk-gonka",
+        llm_attempts=1,
+    )
+
+    summarize([make_email(1)], settings)
+
+    assert seen, "no request was made"
+    for agent in seen:
+        assert not agent.lower().startswith("python")
+        assert agent == settings.llm_user_agent
+
+
+def test_gonka_ladder_retries_with_json_mode_when_free_form_is_not_json(
+    monkeypatch, make_settings, make_email
+) -> None:
+    """GLM answers only with response_format, MiniMax only without it."""
+    modes: list[bool] = []
+
+    def fake_post(url: str, **kwargs):
+        has_format = "response_format" in kwargs["json"]
+        modes.append(has_format)
+        if not has_format:
+            return _JsonResponse("Вот ваш дайджест: всё хорошо, 1 письмо.")
+        return _JsonResponse(json.dumps(DIGEST_PAYLOAD, ensure_ascii=False))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    settings = make_settings(
+        openrouter_api_key="",
+        llm_provider="gonkarouter",
+        gonkarouter_api_key="sk-gonka",
+        gonkarouter_model="zai-org/GLM-5.3-Flash",
+        llm_attempts=1,
+    )
+
+    result = summarize([make_email(1)], settings)
+
+    # Free-form first (MiniMax-friendly), then strict JSON (GLM-friendly).
+    assert modes == [False, True]
+    assert result.model == "zai-org/GLM-5.3-Flash"
+
+
+def test_gonka_targets_are_skipped_without_a_key(make_settings) -> None:
+    settings = make_settings(gonkarouter_enabled=True, gonkarouter_api_key="")
+    assert llm._gonkarouter_targets(settings) == []
+
+    settings = make_settings(gonkarouter_enabled=False, gonkarouter_api_key="sk-x")
+    assert llm._gonkarouter_targets(settings) == []
+
+    settings = make_settings(gonkarouter_enabled=True, gonkarouter_api_key="sk-x")
+    assert [t.model for t in llm._gonkarouter_targets(settings)] == [
+        "MiniMaxAI/MiniMax-M2.7",
+        "zai-org/GLM-5.3-Flash",
+        "deepseek-ai/DeepSeek-V4-Flash-0731",
+    ]
+
+
+def test_duplicate_items_across_categories_are_dropped() -> None:
+    """MiniMax repeats one email in several buckets; keep the most important one."""
+    data = {
+        "mailboxes": [
+            {
+                "name": "Gmail",
+                "important": [{"sender": "bank@x.ru", "subject": "Списание", "summary": "vazhno"}],
+                "work": [{"sender": "bank@x.ru", "subject": "Списание", "summary": "work"}],
+                "other": [
+                    {"sender": "bank@x.ru", "subject": "списание ", "summary": "other"},
+                    {"sender": "pal@x.ru", "subject": "Привет", "summary": "other"},
+                ],
+                "newsletter_count": 0,
+                "spam_count": 0,
+            }
+        ],
+        "action_items": [],
+    }
+
+    result = llm._to_result(data, [], 0.0, "gonkarouter", "MiniMaxAI/MiniMax-M2.7")
+    mailbox = result.mailboxes[0]
+
+    assert [item["summary"] for item in mailbox.important] == ["vazhno"]
+    assert mailbox.work == []
+    assert [item["summary"] for item in mailbox.other] == ["other"]

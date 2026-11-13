@@ -148,6 +148,30 @@ def run_check(settings: Settings) -> int:
             ok = False
             print("OpenRouter: не удалось получить каталог (проверь ключ и сеть)")
 
+    if getattr(settings, "gonkarouter_enabled", False) and settings.gonkarouter_api_key:
+        import requests
+
+        try:
+            response = requests.get(
+                f"{settings.gonkarouter_api_base}/models",
+                headers={
+                    "Authorization": f"Bearer {settings.gonkarouter_api_key}",
+                    "User-Agent": settings.llm_user_agent,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            ids = [entry.get("id") for entry in response.json().get("data", [])]
+            print(f"GonkaRouter: ключ принят, моделей: {len(ids)}")
+            for model in settings.gonka_model_chain:
+                mark = "✓" if model in ids else "⚠️ нет в каталоге"
+                print(f"  · {model} — {mark}")
+        except requests.RequestException as exc:
+            ok = False
+            print(f"GonkaRouter: ❌ {exc}")
+    else:
+        print("GonkaRouter: отключён (GONKAROUTER_API_KEY не задан)")
+
     for fetcher in build_fetchers(settings):
         try:
             print("IMAP:", fetcher.test_connection())

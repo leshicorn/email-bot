@@ -75,7 +75,12 @@ class Settings(BaseSettings):
     imap_timeout: int = 60
 
     # ── LLM provider selection ────────────────────────────────────────────────
-    llm_provider: Literal["openrouter", "openai", "gemini", "ollama", "gigachat"] = "openrouter"
+    llm_provider: Literal[
+        "openrouter", "gonkarouter", "openai", "gemini", "ollama", "gigachat"
+    ] = "openrouter"
+
+    # A real UA: Cloudflare in front of GonkaRouter rejects python-urllib/requests.
+    llm_user_agent: str = "EmailDigestAgent/2.0"
 
     # OpenRouter (primary)
     openrouter_api_key: str = ""
@@ -84,6 +89,18 @@ class Settings(BaseSettings):
     openrouter_fallback_models: Annotated[list[str], NoDecode] = Field(default_factory=list)
     openrouter_site_url: str = "https://github.com/leshicorn/email-bot"
     openrouter_app_title: str = "Email Digest Bot"
+
+    # GonkaRouter — fallback when OpenRouter is rate-limited or out of quota
+    gonkarouter_enabled: bool = True
+    gonkarouter_api_base: str = "https://api.gonkarouter.io/v1"
+    gonkarouter_api_key: str = ""
+    gonkarouter_model: str = "MiniMaxAI/MiniMax-M2.7"
+    gonkarouter_fallback_models: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "zai-org/GLM-5.3-Flash",
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+        ]
+    )
 
     # Shared LLM behaviour
     llm_timeout: int = 90
@@ -156,6 +173,7 @@ class Settings(BaseSettings):
     # ── Validators ────────────────────────────────────────────────────────────
     @field_validator(
         "openrouter_fallback_models",
+        "gonkarouter_fallback_models",
         "skip_senders_containing",
         mode="before",
     )
@@ -182,6 +200,8 @@ class Settings(BaseSettings):
     def _validate_provider(self) -> Settings:
         if self.llm_provider == "openrouter" and not self.openrouter_api_key:
             raise ValueError("OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter")
+        if self.llm_provider == "gonkarouter" and not self.gonkarouter_api_key:
+            raise ValueError("GONKAROUTER_API_KEY is required when LLM_PROVIDER=gonkarouter")
         if self.llm_provider == "openai" and not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
         if self.llm_provider == "gemini" and not self.gemini_api_key:
@@ -199,6 +219,13 @@ class Settings(BaseSettings):
     def model_chain(self) -> list[str]:
         """Primary model first, then the configured fallbacks (deduplicated)."""
         chain = [self.openrouter_model, *self.openrouter_fallback_models]
+        seen: set[str] = set()
+        return [m for m in chain if m and not (m in seen or seen.add(m))]
+
+    @property
+    def gonka_model_chain(self) -> list[str]:
+        """GonkaRouter models: the primary first, then the fallbacks."""
+        chain = [self.gonkarouter_model, *self.gonkarouter_fallback_models]
         seen: set[str] = set()
         return [m for m in chain if m and not (m in seen or seen.add(m))]
 

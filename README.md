@@ -1,5 +1,7 @@
 # Email Digest Agent
 
+**English** · [Русский](README.ru.md)
+
 Self-hosted Telegram bot that turns your mailboxes into a daily AI digest.
 It reads IMAP (Gmail, mail.ru, Yandex), summarises only what is new with an
 OpenRouter model, and delivers a categorised digest to your chat on a schedule —
@@ -38,7 +40,7 @@ Three properties matter more than features:
 | Area | What you get |
 |---|---|
 | Mailboxes | Gmail, mail.ru, Yandex; IMAP over TLS with app passwords; folder is configurable and validated |
-| LLM | OpenRouter with a fallback **chain** of free models; OpenAI, Gemini, Ollama and GigaChat still supported |
+| LLM | OpenRouter (chain of free models) with **GonkaRouter as a fallback provider**; OpenAI, Gemini, Ollama and GigaChat still supported |
 | Reliability | per-mailbox watermark, two-phase dedup, per-chunk degradation, JSON repair, retries with backoff |
 | Delivery | outbox with retry, 4096-safe splitting, `/last`, `/important` |
 | Email parsing | thread collapsing, `.ics` invites, attachment names, `\Seen`/`\Flagged`, `List-Unsubscribe` |
@@ -143,6 +145,49 @@ this was written. `.venv/bin/python main.py --check` prints
 If you need headroom, either buy 10 credits once (1000 free requests/day), or set
 `OPENROUTER_MODEL` to a cheap paid model — the bot prices it from the catalogue.
 
+### Fallback provider: GonkaRouter
+
+When OpenRouter is rate-limited, out of quota, or simply will not answer, the bot
+falls through to [GonkaRouter](https://gonkarouter.io), which is also
+OpenAI-compatible. Quota is tracked **per provider**, so an exhausted OpenRouter
+account no longer costs you the whole digest.
+
+```env
+GONKAROUTER_ENABLED=true
+GONKAROUTER_API_KEY=sk-…
+GONKAROUTER_MODEL=MiniMaxAI/MiniMax-M2.7
+GONKAROUTER_FALLBACK_MODELS=zai-org/GLM-5.3-Flash,deepseek-ai/DeepSeek-V4-Flash-0731
+```
+
+Measured on the same 15-email payload as the OpenRouter table above:
+
+| Model | JSON mode | Time | Tokens | Result |
+|---|---|---|---|---|
+| `MiniMaxAI/MiniMax-M2.7` | **off** | 15.7 s | 3 004 | ✅ best: exactly the 3 right “important” emails |
+| `MiniMaxAI/MiniMax-M2.7` | on | 32.6 s | 5 156 | ❌ 19 601 chars of prose, no JSON |
+| `zai-org/GLM-5.3-Flash` | on | 83 s | 3 351 | ✅ but over-classifies (6 “important”) |
+| `zai-org/GLM-5.3-Flash` | off | — | — | ❌ HTTP 502 |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` | on | 35.4 s | 4 682 | ✅ works, slowest |
+| `deepseek-ai/DeepSeek-V4-Flash-0731` | off | — | — | ❌ truncated reasoning, empty content |
+
+Two quirks worth knowing, both handled by the bot:
+
+- **`response_format` is per-model.** MiniMax returns prose when asked for a JSON
+  object; GLM refuses to answer without it. Each provider therefore has a
+  JSON-mode *ladder* — OpenRouter tries strict first, GonkaRouter tries free-form
+  first — and a non-JSON answer moves to the next rung instead of failing the chunk.
+- **Cloudflare blocks the default Python user-agent.** `python-urllib` and the
+  default `requests` UA get `403 error code: 1010`, so the bot sends
+  `LLM_USER_AGENT` (default `EmailDigestAgent/2.0`).
+
+GonkaRouter publishes no prices in `/models`, so the bot does not invent one: the
+footer shows tokens and the model name, and only a `:free` model earns the
+“бесплатно 🎉” badge.
+
+The service is known to be unreachable from some networks (it needs a route the
+Russian ISPs do not provide); `main.py --check` tells you whether it answers from
+where you run it.
+
 ## Commands
 
 | Command | Action |
@@ -171,6 +216,10 @@ every key. The ones worth knowing:
 | `LLM_PROVIDER` | `openrouter` | `openrouter`, `openai`, `gemini`, `ollama`, `gigachat` |
 | `OPENROUTER_MODEL` | `particle-ai/particle-1:free` | primary model |
 | `OPENROUTER_FALLBACK_MODELS` | `dots-studio/…,google/gemma-4-31b-it:free,…` | comma-separated chain |
+| `GONKAROUTER_ENABLED` | `true` | use the fallback provider at all |
+| `GONKAROUTER_MODEL` | `MiniMaxAI/MiniMax-M2.7` | primary fallback model |
+| `GONKAROUTER_FALLBACK_MODELS` | `zai-org/GLM-5.3-Flash,…` | fallback chain inside GonkaRouter |
+| `LLM_USER_AGENT` | `EmailDigestAgent/2.0` | UA header (Cloudflare rejects the defaults) |
 | `DIGEST_HOUR` / `DIGEST_MINUTE` | `21:00` | daily time in `TIMEZONE` |
 | `TIMEZONE` | `Europe/Moscow` | IANA name |
 | `WEEKLY_DIGEST_ENABLED` | `true` | Sunday summary of the week's stats |
@@ -280,7 +329,9 @@ network access or real credentials.
 - One folder per mailbox.
 - Bodies larger than 5 MB are summarised from headers only (attachments are not
   downloaded).
-- Free OpenRouter models have daily request caps; a very busy mailbox may need a
-  second model in the chain or a paid one.
+- Free OpenRouter models have daily request caps; GonkaRouter covers the gap, but
+  it is not reachable from every network.
+- GonkaRouter does not publish per-token prices, so its digests show tokens and
+  no cost figure.
 - Cost figures come from the OpenRouter catalogue and change with it.
 - Single-user by design — this is a personal assistant, not a multi-tenant service.

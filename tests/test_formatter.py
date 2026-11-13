@@ -77,7 +77,8 @@ def test_format_digest_normal_sections_and_footer() -> None:
     assert "📊 Обработано 3 письма" in text
     assert "test/model" in text
     assert "🪙 200 токенов (вход 120 / выход 80)" in text
-    assert "бесплатно 🎉" in text
+    # "test/model" is not a `:free` model, so we must not claim it is free.
+    assert "бесплатно" not in text
 
 
 def test_format_digest_escapes_html_in_user_content() -> None:
@@ -306,7 +307,7 @@ def test_format_weekly_values_and_empty_defaults() -> None:
     assert "последние 7 дней" in text
 
     empty = format_weekly({})
-    assert "бесплатно" in empty
+    assert "$0.0000" in empty
 
 
 def test_format_help_lists_commands() -> None:
@@ -320,3 +321,24 @@ def test_plural_is_positive_for_negative_numbers(length: int) -> None:
     assert plural(-length, "письмо", "письма", "писем") == plural(
         length, "письмо", "письма", "писем"
     )
+
+
+def test_only_free_models_are_reported_as_free() -> None:
+    """GonkaRouter publishes no prices — silence beats a wrong "бесплатно"."""
+    free = DigestResult(
+        mailboxes=[MailboxDigest(name="Gmail", work=[{"subject": "s", "summary": "x"}])],
+        total_emails=1,
+        model="particle-ai/particle-1:free",
+        total_tokens=42,
+    )
+    assert "бесплатно 🎉" in format_digest(free, datetime(2024, 11, 13))
+
+    unpriced = DigestResult(
+        mailboxes=[MailboxDigest(name="Gmail", work=[{"subject": "s", "summary": "x"}])],
+        total_emails=1,
+        model="MiniMaxAI/MiniMax-M2.7",
+        total_tokens=42,
+    )
+    text = format_digest(unpriced, datetime(2024, 11, 13))
+    assert "бесплатно" not in text
+    assert "MiniMaxAI/MiniMax-M2.7" in text

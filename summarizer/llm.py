@@ -54,6 +54,8 @@ SYSTEM_PROMPT = """Ты — ассистент, который собирает 
 - Рассылки и спам НЕ описывай, только посчитай их количество.
 
 action_items: только конкретные задачи со сроком или действием на сегодня. Без общих слов.
+Каждое письмо описывается РОВНО ОДИН РАЗ и попадает ровно в одну категорию —
+если сомневаешься, выбирай более важную, но не дублируй.
 
 Формат ответа — ТОЛЬКО валидный JSON, без markdown-обёртки и без рассуждений:
 {"mailboxes":[{"name":"...","important":[{"sender":"...","subject":"...","summary":"..."}],"work":[],"other":[],"newsletter_count":0,"spam_count":0}],"action_items":["..."]}
@@ -464,17 +466,39 @@ def _to_result(data: dict, emails: list[Email], cost: float, provider: str, mode
     except ValidationError as exc:
         raise LLMParseError(f"ответ не соответствует схеме: {exc.errors()[:2]}") from exc
 
-    mailboxes = [
-        MailboxDigest(
-            name=mb.name,
-            important=[item.model_dump() for item in mb.important],
-            work=[item.model_dump() for item in mb.work],
-            other=[item.model_dump() for item in mb.other],
-            newsletter_count=mb.newsletter_count,
-            spam_count=mb.spam_count,
+    mailboxes = []
+    for mb in payload.mailboxes:
+        # Models routinely repeat an email across categories (very visible with
+        # MiniMax). Keep the highest-priority occurrence and drop the copies.
+        seen: set[tuple[str, str]] = set()
+        buckets: dict[str, list[dict]] = {}
+        for bucket, items in (
+            ("important", mb.important),
+            ("work", mb.work),
+            ("other", mb.other),
+        ):
+            kept: list[dict] = []
+            for item in items:
+                data = item.model_dump()
+                key = (
+                    str(data.get("subject", "")).strip().lower(),
+                    str(data.get("sender", "")).strip().lower(),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                kept.append(data)
+            buckets[bucket] = kept
+        mailboxes.append(
+            MailboxDigest(
+                name=mb.name,
+                important=buckets["important"],
+                work=buckets["work"],
+                other=buckets["other"],
+                newsletter_count=mb.newsletter_count,
+                spam_count=mb.spam_count,
+            )
         )
-        for mb in payload.mailboxes
-    ]
 
     usage = usage or {}
     prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
@@ -493,28 +517,98 @@ def _to_result(data: dict, emails: list[Email], cost: float, provider: str, mode
     )
 
 
-# ── OpenRouter ───────────────────────────────────────────────────────────────
+# ── Provider chain ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LLMTarget:
+    """One concrete (provider, model) endpoint to try."""
+
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+    #: Order of ``response_format`` attempts for this provider. MiniMax answers
+    #: with free-form prose when asked for a JSON object, while GLM-5.3 refuses
+    #: to answer without it — hence a per-provider ladder.
+    json_ladder: tuple[bool, ...] = (True, False)
+    headers: tuple[tuple[str, str], ...] = ()
+
+
+def _user_agent(settings) -> str:
+    """A real UA string.
+
+    Cloudflare sits in front of some providers (GonkaRouter) and answers
+    ``403 error code: 1010`` to ``python-urllib`` and ``requests`` defaults.
+    """
+    return getattr(settings, "llm_user_agent", "") or "EmailDigestAgent/2.0"
+
+
+def _openrouter_targets(settings) -> list[LLMTarget]:
+    if not settings.openrouter_api_key:
+        return []
+    headers = (
+        ("HTTP-Referer", settings.openrouter_site_url),
+        ("X-Title", settings.openrouter_app_title),
+    )
+    return [
+        LLMTarget(
+            provider="openrouter",
+            base_url=settings.openrouter_api_base,
+            api_key=settings.openrouter_api_key,
+            model=model,
+            json_ladder=(True, False),
+            headers=headers,
+        )
+        for model in settings.model_chain
+    ]
+
+
+def _gonkarouter_targets(settings) -> list[LLMTarget]:
+    if not getattr(settings, "gonkarouter_enabled", False):
+        return []
+    if not getattr(settings, "gonkarouter_api_key", ""):
+        return []
+    return [
+        LLMTarget(
+            provider="gonkarouter",
+            base_url=settings.gonkarouter_api_base,
+            api_key=settings.gonkarouter_api_key,
+            model=model,
+            # Measured: MiniMax returns prose with JSON mode on, GLM 502s with
+            # it off. Try the free-form answer first, then the strict one.
+            json_ladder=(False, True),
+        )
+        for model in settings.gonka_model_chain
+    ]
+
+
+_TARGET_BUILDERS = {
+    "openrouter": _openrouter_targets,
+    "gonkarouter": _gonkarouter_targets,
+}
+
+
+# ── Pricing / quota helpers ──────────────────────────────────────────────────
 
 _PRICING_CACHE: dict[str, Any] = {"fetched_at": 0.0, "models": {}}
 _PRICING_TTL = 3600.0
 
 
 def quota_status(settings) -> dict:
-    """Remaining free-model requests for the configured key, if reported."""
+    """Remaining free-model requests for the configured OpenRouter key."""
     import requests
 
     try:
-        resp = requests.get(
+        response = requests.get(
             f"{settings.openrouter_api_base}/key",
-            headers={"Authorization": f"Bearer {settings.openrouter_api_key}"},
+            headers={
+                "Authorization": f"Bearer {settings.openrouter_api_key}",
+                "User-Agent": _user_agent(settings),
+            },
             timeout=20,
         )
-        resp.raise_for_status()
-        data = resp.json().get("data") or {}
-        quota = data.get("free_model_daily_requests") or {}
-        if quota:
-            return quota
-        return {}
+        response.raise_for_status()
+        return (response.json().get("data") or {}).get("free_model_daily_requests") or {}
     except Exception as exc:  # noqa: BLE001 - informational only
         logger.debug("Quota lookup failed: %s", exc)
         return {}
@@ -528,15 +622,15 @@ def fetch_openrouter_pricing(api_base: str, api_key: str, timeout: int = 20) -> 
     import requests
 
     try:
-        resp = requests.get(
+        response = requests.get(
             f"{api_base}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {api_key}", "User-Agent": "EmailDigestAgent/2.0"},
             timeout=timeout,
         )
-        resp.raise_for_status()
+        response.raise_for_status()
         models = {
             entry["id"]: entry.get("pricing", {})
-            for entry in resp.json().get("data", [])
+            for entry in response.json().get("data", [])
             if entry.get("id")
         }
         _PRICING_CACHE.update({"fetched_at": now, "models": models})
@@ -560,18 +654,24 @@ def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int, prici
     return prompt_tokens * prompt_price + completion_tokens * completion_price
 
 
-def _error_body(response) -> dict:
-    try:
-        payload = response.json()
-    except Exception:  # noqa: BLE001 - non-JSON error pages exist
-        return {}
-    return payload if isinstance(payload, dict) else {}
+def _estimate_cost_for(target: LLMTarget, usage: dict, settings) -> float:
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    if target.provider != "openrouter":
+        # GonkaRouter publishes no prices in /models; do not invent them.
+        return 0.0
+    pricing = fetch_openrouter_pricing(settings.openrouter_api_base, settings.openrouter_api_key)
+    return _estimate_cost(target.model, prompt_tokens, completion_tokens, pricing)
 
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
 
 def _is_daily_quota(response) -> bool:
-    error = (_error_body(response).get("error") or {})
-    metadata = error.get("metadata") or {}
-    source = str(metadata.get("limit_source") or "")
+    try:
+        error = response.json().get("error") or {}
+    except Exception:  # noqa: BLE001 - non-JSON error pages exist
+        return False
+    source = str((error.get("metadata") or {}).get("limit_source") or "")
     return "daily" in source or "free_tier" in source
 
 
@@ -582,109 +682,137 @@ def _daily_quota_reset(response) -> datetime | None:
     return None
 
 
-def _openrouter_request(
-    settings,
-    model: str,
-    messages: list[dict[str, str]],
-) -> tuple[str, dict, float]:
-    """One chat completion; retries transport errors, not model-specific ones."""
+def _retry_delay(response, attempt: int, settings) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if (retry_after or "").isdigit():
+        return min(float(retry_after), 60.0)
+    return min(settings.llm_backoff_base * (2 ** (attempt - 1)), 60.0)
+
+
+def _post_completion(target: LLMTarget, messages: list[dict[str, str]], settings, json_mode: bool):
+    """One HTTP POST. Raises only for network failures."""
     import requests
 
-    url = f"{settings.openrouter_api_base}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": settings.openrouter_site_url,
-        "X-Title": settings.openrouter_app_title,
+    payload: dict[str, Any] = {
+        "model": target.model,
+        "messages": messages,
+        "temperature": settings.llm_temperature,
+        "max_tokens": settings.llm_max_tokens,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
 
-    def _payload(json_mode: bool) -> dict:
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": settings.llm_temperature,
-            "max_tokens": settings.llm_max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        return payload
+    headers = {
+        "Authorization": f"Bearer {target.api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": _user_agent(settings),
+    }
+    headers.update(dict(target.headers))
 
+    try:
+        return requests.post(
+            f"{target.base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=settings.llm_timeout,
+        )
+    except requests.RequestException as exc:
+        raise LLMTransportError(f"{target.model}: {exc}") from exc
+
+
+def _call_target(
+    target: LLMTarget,
+    messages: list[dict[str, str]],
+    settings,
+    emails: list[Email],
+) -> DigestResult:
+    """Try one model: retries transport errors, walks the JSON-mode ladder."""
     last_error: Exception | None = None
+
     for attempt in range(1, settings.llm_attempts + 1):
-        for json_mode in (True, False):
+        retryable = False
+        for json_mode in target.json_ladder:
             try:
-                response = requests.post(
-                    url, headers=headers, json=_payload(json_mode), timeout=settings.llm_timeout
-                )
-            except requests.RequestException as exc:
-                last_error = LLMTransportError(str(exc))
-                break  # network problem — retry, do not toggle json_mode
+                response = _post_completion(target, messages, settings, json_mode)
+            except LLMTransportError as exc:
+                last_error = exc
+                retryable = True
+                break
 
             if response.status_code == 200:
-                data = response.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    raise LLMModelUnavailable(f"{model}: пустой choices")
-                content = (choices[0].get("message") or {}).get("content") or ""
-                usage = data.get("usage") or {}
-                pricing = fetch_openrouter_pricing(
-                    settings.openrouter_api_base, settings.openrouter_api_key
-                )
-                cost = _estimate_cost(
-                    model,
-                    int(usage.get("prompt_tokens") or 0),
-                    int(usage.get("completion_tokens") or 0),
-                    pricing,
-                )
-                finish = choices[0].get("finish_reason")
+                body = response.json()
+                choice = (body.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                content = message.get("content") or ""
+                finish = choice.get("finish_reason")
                 if not content.strip():
                     raise LLMModelUnavailable(
-                        f"{model}: пустой ответ (finish_reason={finish}) — "
+                        f"{target.model}: пустой ответ (finish_reason={finish}) — "
                         "вероятно, модель израсходовала лимит на reasoning"
                     )
-                return content, usage, cost
-
-            body = response.text[:300]
-            if response.status_code in (400, 404, 403, 422) and json_mode:
-                logger.debug("%s rejected response_format, retrying without it", model)
-                continue  # second iteration: json_mode=False
-            if response.status_code in (400, 403, 404, 422):
-                raise LLMModelUnavailable(f"{model}: HTTP {response.status_code} {body}")
-            if response.status_code == 402:
-                raise LLMTransportError(f"{model}: кредиты исчерпаны (402) {body}")
-            if response.status_code == 429:
-                reset_at = _daily_quota_reset(response)
-                if reset_at is not None or _is_daily_quota(response):
-                    raise LLMQuotaExceeded(
-                        "дневной лимит бесплатных моделей OpenRouter исчерпан",
-                        reset_at=reset_at,
+                try:
+                    parsed = parse_response(content)
+                except LLMParseError as exc:
+                    last_error = exc
+                    logger.debug(
+                        "%s returned non-JSON with json_mode=%s — trying the other mode",
+                        target.model, json_mode,
                     )
-                retry_after = response.headers.get("Retry-After")
-                delay = (
-                    float(retry_after)
-                    if (retry_after or "").isdigit()
-                    else settings.llm_backoff_base * attempt
+                    continue
+                usage = body.get("usage") or {}
+                return _to_result(
+                    parsed,
+                    emails,
+                    _estimate_cost_for(target, usage, settings),
+                    target.provider,
+                    target.model,
+                    usage,
                 )
-                last_error = LLMTransportError(f"{model}: 429 rate limit")
-                logger.warning("%s rate-limited, sleeping %.0fs", model, min(delay, 60))
-                time.sleep(min(delay, 60))
-                break  # retry outer attempt
-            last_error = LLMTransportError(f"{model}: HTTP {response.status_code} {body}")
-            break  # 5xx → retry outer attempt
 
-        if last_error and isinstance(last_error, LLMTransportError) and attempt < settings.llm_attempts:
-            delay = settings.llm_backoff_base * (2 ** (attempt - 1))
-            logger.warning(
-                "LLM call failed (attempt %d/%d): %s — retry in %.0fs",
-                attempt, settings.llm_attempts, last_error, delay,
+            if response.status_code == 429:
+                reset = _daily_quota_reset(response)
+                if _is_daily_quota(response) or reset is not None:
+                    raise LLMQuotaExceeded(
+                        f"{target.provider}: дневной лимит исчерпан", reset_at=reset
+                    )
+                last_error = LLMTransportError(f"{target.model}: 429 rate limit")
+                delay = _retry_delay(response, attempt, settings)
+                logger.warning("%s rate-limited, sleeping %.0fs", target.model, delay)
+                time.sleep(delay)
+                retryable = True
+                break
+
+            if response.status_code in (400, 403, 404, 422):
+                last_error = LLMModelUnavailable(
+                    f"{target.model}: HTTP {response.status_code} {response.text[:200]}"
+                )
+                logger.debug("%s rejected the request, trying the other JSON mode", target.model)
+                continue
+
+            last_error = LLMTransportError(
+                f"{target.model}: HTTP {response.status_code} {response.text[:200]}"
             )
-            time.sleep(delay)
+            retryable = True
+            break
 
-    raise last_error or LLMTransportError(f"{model}: неизвестная ошибка")
+        if not retryable:
+            break
+        if attempt < settings.llm_attempts:
+            time.sleep(settings.llm_backoff_base * (2 ** (attempt - 1)))
+
+    raise last_error or LLMError(f"{target.model}: неизвестная ошибка")
 
 
-def _summarize_openrouter(emails: list[Email], settings) -> DigestResult:
-    """Try every model in the chain until one returns a usable answer."""
+def _summarize_target_chain(
+    emails: list[Email],
+    settings,
+    providers: tuple[str, ...],
+) -> DigestResult:
+    """Walk providers, then their models, until one returns usable JSON.
+
+    A quota error is account-wide for that provider, so its remaining models are
+    skipped and the next provider is tried — the whole point of the fallback.
+    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -692,27 +820,58 @@ def _summarize_openrouter(emails: list[Email], settings) -> DigestResult:
             "content": build_user_prompt(emails, max_chars=settings.max_prompt_chars),
         },
     ]
+
     errors: list[str] = []
-    for model in settings.model_chain:
-        try:
-            content, usage, cost = _openrouter_request(settings, model, messages)
-            data = parse_response(content)
-            result = _to_result(data, emails, cost, "openrouter", model, usage)
+    quota_error: LLMQuotaExceeded | None = None
+
+    for provider in providers:
+        targets = _TARGET_BUILDERS[provider](settings)
+        if not targets:
+            continue
+        for target in targets:
+            try:
+                result = _call_target(target, messages, settings, emails)
+            except LLMQuotaExceeded as exc:
+                quota_error = exc
+                errors.append(f"{provider}: квота")
+                logger.warning(
+                    "Provider %s is out of quota — falling through to the next provider",
+                    provider,
+                )
+                break  # the whole provider shares the account limit
+            except LLMModelUnavailable as exc:
+                errors.append(str(exc))
+                logger.warning("Model unavailable: %s", exc)
+                continue
+            except LLMTransportError as exc:
+                errors.append(str(exc))
+                logger.warning("Transport error, trying next target: %s", exc)
+                continue
+            except LLMParseError as exc:
+                errors.append(str(exc))
+                logger.warning("Unusable JSON from %s: %s", target.model, exc)
+                continue
+
             if errors:
-                logger.info("Model %s succeeded after %d failed attempt(s)", model, len(errors))
+                logger.info(
+                    "%s/%s answered after %d failed attempt(s)",
+                    provider, target.model, len(errors),
+                )
             return result
-        except LLMParseError as exc:
-            errors.append(f"{model}: {exc}")
-            logger.warning("Model %s returned unusable JSON: %s", model, exc)
-        except LLMQuotaExceeded:
-            raise
-        except LLMModelUnavailable as exc:
-            errors.append(f"{model}: {exc}")
-            logger.warning("Model unavailable: %s", exc)
-        except LLMTransportError as exc:
-            errors.append(f"{model}: {exc}")
-            logger.warning("Transport error, trying next model: %s", exc)
-    raise LLMError("Все модели из цепочки не ответили: " + " | ".join(errors[:3]))
+
+    if quota_error is not None:
+        raise quota_error
+    raise LLMError("Все модели не ответили: " + " | ".join(errors[:4]))
+
+
+def _summarize_openrouter(emails: list[Email], settings) -> DigestResult:
+    """Default path: OpenRouter first, GonkaRouter as the fallback."""
+    return _summarize_target_chain(emails, settings, ("openrouter", "gonkarouter"))
+
+
+def _summarize_gonkarouter(emails: list[Email], settings) -> DigestResult:
+    """GonkaRouter first, OpenRouter as the fallback."""
+    return _summarize_target_chain(emails, settings, ("gonkarouter", "openrouter"))
 
 
 # ── Other providers (kept for completeness) ──────────────────────────────────
@@ -829,6 +988,7 @@ def _summarize_gigachat(emails: list[Email], settings) -> DigestResult:
 
 _DISPATCH = {
     "openrouter": _summarize_openrouter,
+    "gonkarouter": _summarize_gonkarouter,
     "openai": _summarize_openai,
     "gemini": _summarize_gemini,
     "ollama": _summarize_ollama,

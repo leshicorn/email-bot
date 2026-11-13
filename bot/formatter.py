@@ -163,7 +163,9 @@ def format_digest(
             )
         if result.cost_usd > 0:
             parts.append(f"· ${result.cost_usd:.4f}")
-        elif result.total_tokens:
+        elif result.total_tokens and ":free" in (result.model or "").lower():
+            # Only a `:free` model is known to cost nothing; GonkaRouter does not
+            # publish prices, so silence is more honest than "бесплатно".
             parts.append("· бесплатно 🎉")
         if result.quota_exhausted:
             parts.append("· ⚠️ лимит бесплатных моделей")
@@ -279,9 +281,7 @@ def format_weekly(stats: dict, period_days: int = 7) -> str:
     lines.append(f"🔁 Запусков: <b>{stats.get('runs_7d', 0)}</b>")
     lines.append(f"🪙 Токенов: <b>{stats.get('tokens_7d', 0)}</b>")
     cost = float(stats.get("cost_7d") or 0)
-    lines.append(
-        f"💸 Расход: <b>{'бесплатно' if cost == 0 else f'${cost:.4f}'}</b>"
-    )
+    lines.append(f"💸 Расход: <b>${cost:.4f}</b> <i>(оценка)</i>")
     if stats.get("processed_total"):
         lines.append(f"🗂 Всего в базе: <b>{stats['processed_total']}</b> писем")
     lines.append("")
