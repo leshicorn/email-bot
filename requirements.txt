@@ -1,0 +1,17 @@
+# Core
+imapclient>=2.3.1
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# Telegram
+python-telegram-bot>=21.0
+
+# Scheduler
+APScheduler>=3.10
+
+# LLM providers (OpenRouter and anything OpenAI-compatible)
+openai>=1.30
+
+# HTTP + parsing
+requests>=2.32
+beautifulsoup4>=4.12

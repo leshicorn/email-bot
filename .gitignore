@@ -1,0 +1,29 @@
+# Secrets and generated state
+.env
+data/
+bot.log
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local tooling
+.dsh-project-memory/

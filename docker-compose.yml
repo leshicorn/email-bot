@@ -1,0 +1,15 @@
+services:
+  email-bot:
+    build: .
+    container_name: email-digest-agent
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./bot.log:/app/bot.log
+    # The bot polls Telegram, so it needs no published ports.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Email Digest Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace YOURUSER before installing.
+User=YOURUSER
+Group=YOURUSER
+WorkingDirectory=/home/YOURUSER/email-bot
+ExecStart=/home/YOURUSER/email-bot/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+# .env lives next to the code, so no EnvironmentFile directive is needed.
+
+# Hardening: the bot only writes data/, logs and the lock file.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/YOURUSER/email-bot/data /home/YOURUSER/email-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
